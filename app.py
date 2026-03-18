@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -10,13 +11,39 @@ import streamlit.components.v1 as components
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "portfolio.db")
+def resolve_db_path():
+    override = os.getenv("STOCKRECORDS_DB_PATH")
+    if override:
+        path = Path(override).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    app_dir = Path(__file__).resolve().parent
+    bundled_data_dir = app_dir / "data"
+    try:
+        bundled_data_dir.mkdir(parents=True, exist_ok=True)
+        probe = bundled_data_dir / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return str(bundled_data_dir / "portfolio.db")
+    except OSError:
+        pass
+
+    fallback_dir = Path.home() / ".stockrecords"
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    return str(fallback_dir / "portfolio.db")
+
+
+DB_PATH = resolve_db_path()
 
 
 @st.cache_resource(show_spinner=False)
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout = 30000;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
     init_db(conn)
     return conn
 
@@ -1113,7 +1140,7 @@ def main():
         "期权策略": page_options,
     }
     choice = st.sidebar.radio("菜单", list(menu.keys()))
-    st.sidebar.caption("数据持久化保存在 data/portfolio.db")
+    st.sidebar.caption(f"数据持久化保存在 {DB_PATH}")
     menu[choice](conn)
 
 
