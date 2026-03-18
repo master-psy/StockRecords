@@ -71,6 +71,7 @@ def init_db(conn):
         );
         """
     )
+    ensure_column(conn, "targets", "research_md", "TEXT")
     conn.commit()
     if conn.execute("SELECT COUNT(1) FROM events").fetchone()[0] == 0:
         today = datetime.today().date()
@@ -85,6 +86,13 @@ def init_db(conn):
                 "INSERT INTO events (event_date, category, ticker, title, impact) VALUES (?, ?, ?, ?, ?)",
                 (row[0].isoformat(), row[1], row[2], row[3], row[4]),
             )
+        conn.commit()
+
+
+def ensure_column(conn, table_name, column_name, column_type):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
         conn.commit()
 
 
@@ -131,11 +139,12 @@ def save_transaction(conn, data):
 def save_target(conn, data):
     conn.execute(
         """
-        INSERT INTO targets (ticker, name, sector, target_price, stop_price, bs_point, thesis)
-        VALUES (:ticker, :name, :sector, :target_price, :stop_price, :bs_point, :thesis)
+        INSERT INTO targets (ticker, name, sector, target_price, stop_price, bs_point, thesis, research_md)
+        VALUES (:ticker, :name, :sector, :target_price, :stop_price, :bs_point, :thesis, :research_md)
         ON CONFLICT(ticker) DO UPDATE SET
             name=excluded.name, sector=excluded.sector, target_price=excluded.target_price,
-            stop_price=excluded.stop_price, bs_point=excluded.bs_point, thesis=excluded.thesis
+            stop_price=excluded.stop_price, bs_point=excluded.bs_point, thesis=excluded.thesis,
+            research_md=excluded.research_md
         """,
         data,
     )
@@ -536,6 +545,25 @@ def render_strategy_curve(payload, title_prefix=""):
     st.dataframe(focus.style.format({"Underlying Price": "{:.2f}", "P/L at Expiry": "{:.2f}"}), use_container_width=True)
 
 
+def render_research_card(row):
+    title = f"{row['ticker']}"
+    if row.get("name"):
+        title = f"{title} | {row['name']}"
+    with st.container(border=True):
+        st.subheader(title)
+        meta_cols = st.columns(4)
+        meta_cols[0].metric("目标价", "-" if pd.isna(row.get("target_price")) else f"{float(row['target_price']):.2f}")
+        meta_cols[1].metric("止损价", "-" if pd.isna(row.get("stop_price")) else f"{float(row['stop_price']):.2f}")
+        meta_cols[2].write(f"行业：{row.get('sector') or '-'}")
+        meta_cols[3].write(f"关键点位：{row.get('bs_point') or '-'}")
+        if row.get("thesis"):
+            st.markdown("**投资逻辑**")
+            st.write(row["thesis"])
+        st.markdown("**调研内容**")
+        research_body = row.get("research_md") or "_暂无调研内容_"
+        st.markdown(research_body, unsafe_allow_html=True)
+
+
 def build_strategy_curve(strategy, prices, spot_price, contracts, long_call_leg=None, short_call_leg=None, long_put_leg=None, short_put_leg=None, stock_shares=100):
     payoff = np.zeros_like(prices, dtype=float)
     desc = []
@@ -605,86 +633,125 @@ def build_strategy_curve(strategy, prices, spot_price, contracts, long_call_leg=
 
 
 def page_dashboard(conn):
-    st.header("Portfolio Dashboard")
+    st.header("投资组合总览")
     positions = merge_market_values(compute_positions(load_transactions(conn)), load_prices(conn))
     if positions.empty:
-        st.info("No trades yet. Add your first transaction to start tracking.")
+        st.info("还没有交易记录，先添加第一笔交易吧。")
         return
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Invested Cost", format_number(positions["invested"].sum()))
-    c2.metric("Market Value", format_number(positions["market_value"].sum(min_count=1)))
-    c3.metric("Unrealized P/L", format_number(positions["unrealized"].sum(min_count=1)))
-    c4.metric("Realized P/L", format_number(positions["realized"].sum()))
-    st.subheader("Positions")
-    table = positions[["ticker", "sector", "shares", "avg_cost", "last_price", "market_value", "unrealized", "pnl_pct", "realized"]].rename(columns={"ticker": "Ticker", "sector": "Sector", "shares": "Shares", "avg_cost": "Avg Cost", "last_price": "Last Price", "market_value": "Market Value", "unrealized": "Unrealized", "pnl_pct": "Unrealized %", "realized": "Realized"})
-    st.dataframe(table.style.format({"Shares": "{:.2f}", "Avg Cost": "{:.2f}", "Last Price": "{:.2f}", "Market Value": "{:.2f}", "Unrealized": "{:.2f}", "Unrealized %": "{:.2f}%", "Realized": "{:.2f}"}), use_container_width=True)
+    c1.metric("投入成本", format_number(positions["invested"].sum()))
+    c2.metric("持仓市值", format_number(positions["market_value"].sum(min_count=1)))
+    c3.metric("浮动盈亏", format_number(positions["unrealized"].sum(min_count=1)))
+    c4.metric("已实现盈亏", format_number(positions["realized"].sum()))
+    st.subheader("持仓明细")
+    table = positions[["ticker", "sector", "shares", "avg_cost", "last_price", "market_value", "unrealized", "pnl_pct", "realized"]].rename(columns={"ticker": "代码", "sector": "行业", "shares": "持仓数量", "avg_cost": "持仓成本", "last_price": "最新价", "market_value": "持仓市值", "unrealized": "浮动盈亏", "pnl_pct": "浮动收益率", "realized": "已实现盈亏"})
+    st.dataframe(table.style.format({"持仓数量": "{:.2f}", "持仓成本": "{:.2f}", "最新价": "{:.2f}", "持仓市值": "{:.2f}", "浮动盈亏": "{:.2f}", "浮动收益率": "{:.2f}%", "已实现盈亏": "{:.2f}"}), use_container_width=True)
     with st.form("update_price"):
-        ticker = st.selectbox("Ticker", positions["ticker"].tolist())
-        price = st.number_input("Last Price", min_value=0.0, step=0.01)
-        submitted = st.form_submit_button("Save Price")
+        ticker = st.selectbox("代码", positions["ticker"].tolist())
+        price = st.number_input("最新价", min_value=0.0, step=0.01)
+        submitted = st.form_submit_button("保存价格")
     if submitted:
         save_price(conn, ticker, price)
-        st.success(f"Saved latest price for {ticker}.")
+        st.success(f"已保存 {ticker} 的最新价。")
         st.rerun()
-    st.subheader("Sector Mix")
+    st.subheader("行业分布")
     st.bar_chart(positions.groupby("sector", dropna=False)["market_value"].sum().sort_values(ascending=False), height=260)
 
 
 def page_transactions(conn):
-    st.header("Transactions")
+    st.header("交易记录")
     with st.form("trade_form"):
         cols = st.columns(3)
-        trade_date = cols[0].date_input("Date", value=date.today())
-        ticker = cols[1].text_input("Ticker", placeholder="AAPL")
-        side = cols[2].selectbox("Side", ["Buy", "Sell"])
+        trade_date = cols[0].date_input("日期", value=date.today())
+        ticker = cols[1].text_input("代码", placeholder="AAPL")
+        side = cols[2].selectbox("方向", ["Buy", "Sell"], format_func=lambda x: "买入" if x == "Buy" else "卖出")
         qcol, pcol, fcol = st.columns(3)
-        qty = qcol.number_input("Quantity", min_value=0.0, step=1.0)
-        price = pcol.number_input("Price", min_value=0.0, step=0.01)
-        fees = fcol.number_input("Fees", min_value=0.0, step=0.01, value=0.0)
-        sector = st.text_input("Sector")
-        note = st.text_area("Note", height=80)
-        submitted = st.form_submit_button("Save")
+        qty = qcol.number_input("数量", min_value=0.0, step=1.0)
+        price = pcol.number_input("成交价", min_value=0.0, step=0.01)
+        fees = fcol.number_input("费用", min_value=0.0, step=0.01, value=0.0)
+        sector = st.text_input("行业")
+        note = st.text_area("备注", height=80)
+        submitted = st.form_submit_button("保存")
     if submitted:
         if not ticker or qty <= 0 or price <= 0:
-            st.error("Ticker, quantity, and price are required.")
+            st.error("代码、数量和成交价不能为空。")
         else:
             save_transaction(conn, {"date": trade_date.isoformat(), "ticker": ticker.upper(), "side": side.lower(), "quantity": qty, "price": price, "fees": fees, "sector": sector, "note": note})
-            st.success("Transaction saved.")
+            st.success("交易已保存。")
             st.rerun()
     trades = load_transactions(conn)
     if not trades.empty:
-        st.subheader("History")
+        st.subheader("历史记录")
         st.dataframe(trades, use_container_width=True)
 
 
 def page_targets(conn):
-    st.header("Watchlist and Plan")
+    st.header("个股研究")
     with st.form("target_form"):
         cols = st.columns(3)
-        ticker = cols[0].text_input("Ticker", placeholder="TSLA")
-        name = cols[1].text_input("Name")
-        sector = cols[2].text_input("Sector")
+        ticker = cols[0].text_input("代码", placeholder="TSLA")
+        name = cols[1].text_input("名称")
+        sector = cols[2].text_input("行业")
         tcol, scol = st.columns(2)
-        target_price = tcol.number_input("Target Price", min_value=0.0, step=0.1)
-        stop_price = scol.number_input("Stop Price", min_value=0.0, step=0.1)
-        bs_point = st.text_input("Key Buy/Sell Levels")
-        thesis = st.text_area("Thesis / Catalysts", height=100)
-        submitted = st.form_submit_button("Save / Update")
+        target_price = tcol.number_input("目标价", min_value=0.0, step=0.1)
+        stop_price = scol.number_input("止损价", min_value=0.0, step=0.1)
+        bs_point = st.text_input("关键买卖点位")
+        thesis = st.text_area("投资逻辑 / 催化剂", height=100)
+        research_md = st.text_area(
+            "调研内容（支持 Markdown / 简单 HTML）",
+            height=220,
+            placeholder="例如：\n## 结论\n- 核心观点\n- 风险点\n\n> 可粘贴 Markdown 内容",
+        )
+        submitted = st.form_submit_button("保存 / 更新")
     if submitted:
         if not ticker:
-            st.error("Ticker is required.")
+            st.error("代码不能为空。")
         else:
-            save_target(conn, {"ticker": ticker.upper(), "name": name, "sector": sector, "target_price": target_price or None, "stop_price": stop_price or None, "bs_point": bs_point, "thesis": thesis})
-            st.success("Watchlist item saved.")
+            save_target(
+                conn,
+                {
+                    "ticker": ticker.upper(),
+                    "name": name,
+                    "sector": sector,
+                    "target_price": target_price or None,
+                    "stop_price": stop_price or None,
+                    "bs_point": bs_point,
+                    "thesis": thesis,
+                    "research_md": research_md,
+                },
+            )
+            st.success("个股研究已保存。")
             st.rerun()
     targets = load_targets(conn)
-    if not targets.empty:
-        st.subheader("Current Watchlist")
-        st.dataframe(targets, use_container_width=True)
+    if targets.empty:
+        st.info("还没有任何个股研究，先新增一条吧。")
+        return
+    st.subheader("研究总表")
+    summary = targets[["ticker", "name", "sector", "target_price", "stop_price", "bs_point"]].rename(
+        columns={"ticker": "代码", "name": "名称", "sector": "行业", "target_price": "目标价", "stop_price": "止损价", "bs_point": "关键点位"}
+    )
+    st.dataframe(summary, use_container_width=True)
+    st.subheader("研究展示")
+    for _, row in targets.iterrows():
+        label = f"{row['ticker']} | {row['name'] or '未命名'}"
+        with st.expander(label, expanded=False):
+            render_research_card(row.to_dict())
+    with st.expander("Markdown 预览说明"):
+        st.markdown(
+            """
+支持常见 Markdown 语法：
+- `#`、`##` 标题
+- `-` 列表
+- `**加粗**`
+- 表格、引用、代码块
+
+也支持简单 HTML 标签，例如 `<br>`、`<span>`、`<div>`。
+            """
+        )
 
 
 def page_realtime_watchlist(conn):
-    st.header("Realtime Watchlist")
+    st.header("实时自选")
     st.caption("支持 A 股、港股、美股与美股期权。股票代码示例：600519、0700、AAPL；期权按标的+到期日+行权价添加。")
 
     with st.expander("新增自选标的", expanded=True):
@@ -830,113 +897,113 @@ def page_realtime_watchlist(conn):
 
 
 def page_events(conn):
-    st.header("Upcoming Events")
+    st.header("事件日历")
     today = datetime.today().date()
     upcoming = load_events(conn)
     upcoming = upcoming[(upcoming["event_date"].dt.date >= today) & (upcoming["event_date"].dt.date <= today + relativedelta(months=6))]
     if upcoming.empty:
-        st.info("No upcoming events yet. Add your own below.")
+        st.info("未来半年还没有事件，下面可以自行新增。")
     else:
-        st.subheader("Timeline")
-        st.dataframe(upcoming.rename(columns={"event_date": "Date", "category": "Category", "ticker": "Ticker", "title": "Event", "impact": "Impact"}), use_container_width=True)
+        st.subheader("时间线")
+        st.dataframe(upcoming.rename(columns={"event_date": "日期", "category": "类别", "ticker": "代码", "title": "事件", "impact": "影响"}), use_container_width=True)
     with st.form("event_form"):
-        event_date = st.date_input("Date", value=today + timedelta(days=7))
-        category = st.selectbox("Category", ["macro", "stock"])
-        ticker = st.text_input("Ticker")
-        title = st.text_input("Title")
-        impact = st.text_area("Impact", height=80)
-        submitted = st.form_submit_button("Save Event")
+        event_date = st.date_input("日期", value=today + timedelta(days=7))
+        category = st.selectbox("类别", ["macro", "stock"], format_func=lambda x: "宏观" if x == "macro" else "个股")
+        ticker = st.text_input("代码")
+        title = st.text_input("事件标题")
+        impact = st.text_area("影响说明", height=80)
+        submitted = st.form_submit_button("保存事件")
     if submitted:
         if not title:
-            st.error("Event title is required.")
+            st.error("事件标题不能为空。")
         else:
             save_event(conn, {"event_date": event_date.isoformat(), "category": category, "ticker": ticker.upper() if ticker else None, "title": title, "impact": impact})
-            st.success("Event saved.")
+            st.success("事件已保存。")
             st.rerun()
 
 
 def page_options(conn):
-    st.header("Options Payoff Curves")
+    st.header("期权策略")
     st.caption("支持期权策略到期收益曲线查看，并可将策略组持久化保存到本地数据库。")
-    ticker = st.text_input("Ticker", value="AAPL", help="Examples: AAPL, TSLA, SPY").upper().strip()
+    ticker = st.text_input("标的代码", value="AAPL", help="示例：AAPL、TSLA、SPY").upper().strip()
     if not ticker:
-        st.info("Enter a ticker to continue.")
+        st.info("请输入标的代码后继续。")
         return
     try:
         snapshot = fetch_stock_snapshot(ticker)
     except Exception as exc:
-        st.error(f"Price fetch failed: {exc}")
-        st.info("Try a liquid US options ticker such as AAPL, TSLA, SPY, or QQQ.")
+        st.error(f"获取价格失败：{exc}")
+        st.info("请尝试流动性更好的美股期权标的，例如 AAPL、TSLA、SPY、QQQ。")
         return
     c1, c2, c3 = st.columns(3)
-    c1.metric("Spot Price", f"{snapshot['price']:.2f}")
-    c2.metric("Recent Change", "-" if snapshot["change_pct"] is None else f"{snapshot['change_pct']:+.2f}%")
-    c3.metric("Expirations", str(len(snapshot["expirations"])))
+    c1.metric("标的现价", f"{snapshot['price']:.2f}")
+    c2.metric("近期涨跌幅", "-" if snapshot["change_pct"] is None else f"{snapshot['change_pct']:+.2f}%")
+    c3.metric("可选到期日", str(len(snapshot["expirations"])))
     if not snapshot["expirations"]:
-        st.warning("No option expirations were returned for this ticker.")
+        st.warning("该标的没有返回可用到期日。")
         return
     row = st.columns(3)
-    expiration = row[0].selectbox("Expiration", snapshot["expirations"])
-    strategy = row[1].selectbox("Strategy", ["Long Call", "Long Put", "Covered Call", "Protective Put", "Bull Call Spread", "Bull Put Spread", "Bear Put Spread", "Long Straddle", "Iron Condor"])
-    contracts = int(row[2].number_input("Contracts", min_value=1, max_value=20, value=1, step=1))
+    expiration = row[0].selectbox("到期日", snapshot["expirations"])
+    strategy = row[1].selectbox("策略", ["Long Call", "Long Put", "Covered Call", "Protective Put", "Bull Call Spread", "Bull Put Spread", "Bear Put Spread", "Long Straddle", "Iron Condor"])
+    contracts = int(row[2].number_input("合约数", min_value=1, max_value=20, value=1, step=1))
     try:
         calls, puts = fetch_option_chain(ticker, expiration)
     except Exception as exc:
-        st.error(f"Option chain fetch failed: {exc}")
+        st.error(f"获取期权链失败：{exc}")
         return
     if calls.empty and puts.empty:
-        st.warning("No calls or puts were returned for that expiration.")
+        st.warning("该到期日没有返回可用期权。")
         return
     call_center = int((calls["strike"] - snapshot["price"]).abs().idxmin()) if not calls.empty else 0
     put_center = int((puts["strike"] - snapshot["price"]).abs().idxmin()) if not puts.empty else 0
     prices = make_price_grid(snapshot["price"])
     long_call_leg = short_call_leg = long_put_leg = short_put_leg = None
     stock_shares = contracts * 100
-    st.subheader("Leg Selection")
+    st.subheader("腿部选择")
     if strategy == "Long Call":
-        long_call_leg = choose_contract(calls, "Long Call Leg", call_center)
+        long_call_leg = choose_contract(calls, "买入 Call", call_center)
     elif strategy == "Long Put":
-        long_put_leg = choose_contract(puts, "Long Put Leg", put_center)
+        long_put_leg = choose_contract(puts, "买入 Put", put_center)
     elif strategy == "Covered Call":
-        stock_shares = int(st.number_input("Stock Shares", min_value=100, value=contracts * 100, step=100))
+        stock_shares = int(st.number_input("正股持仓股数", min_value=100, value=contracts * 100, step=100))
         contracts = max(1, stock_shares // 100)
-        short_call_leg = choose_contract(calls, "Short Call Leg", call_center)
+        short_call_leg = choose_contract(calls, "卖出 Call", call_center)
     elif strategy == "Protective Put":
-        stock_shares = int(st.number_input("Stock Shares", min_value=100, value=contracts * 100, step=100))
+        stock_shares = int(st.number_input("正股持仓股数", min_value=100, value=contracts * 100, step=100))
         contracts = max(1, stock_shares // 100)
-        long_put_leg = choose_contract(puts, "Long Put Leg", put_center)
+        long_put_leg = choose_contract(puts, "买入 Put", put_center)
     elif strategy == "Bull Call Spread":
         left, right = st.columns(2)
         with left:
-            long_call_leg = choose_contract(calls, "Long Lower Strike Call", max(call_center - 1, 0))
+            long_call_leg = choose_contract(calls, "买入低行权价 Call", max(call_center - 1, 0))
         with right:
-            short_call_leg = choose_contract(calls, "Short Higher Strike Call", min(call_center + 1, len(calls) - 1))
+            short_call_leg = choose_contract(calls, "卖出高行权价 Call", min(call_center + 1, len(calls) - 1))
     elif strategy == "Bull Put Spread":
         left, right = st.columns(2)
         with left:
-            short_put_leg = choose_contract(puts, "Short Higher Strike Put", min(put_center + 1, len(puts) - 1))
+            short_put_leg = choose_contract(puts, "卖出高行权价 Put", min(put_center + 1, len(puts) - 1))
         with right:
-            long_put_leg = choose_contract(puts, "Long Lower Strike Put", max(put_center - 1, 0))
+            long_put_leg = choose_contract(puts, "买入低行权价 Put", max(put_center - 1, 0))
     elif strategy == "Bear Put Spread":
         left, right = st.columns(2)
         with left:
-            long_put_leg = choose_contract(puts, "Long Higher Strike Put", min(put_center + 1, len(puts) - 1))
+            long_put_leg = choose_contract(puts, "买入高行权价 Put", min(put_center + 1, len(puts) - 1))
         with right:
-            short_put_leg = choose_contract(puts, "Short Lower Strike Put", max(put_center - 1, 0))
+            short_put_leg = choose_contract(puts, "卖出低行权价 Put", max(put_center - 1, 0))
     elif strategy == "Long Straddle":
         left, right = st.columns(2)
         with left:
-            long_call_leg = choose_contract(calls, "ATM Call", call_center)
+            long_call_leg = choose_contract(calls, "平值 Call", call_center)
         with right:
-            long_put_leg = choose_contract(puts, "ATM Put", put_center)
+            long_put_leg = choose_contract(puts, "平值 Put", put_center)
     elif strategy == "Iron Condor":
         left, right = st.columns(2)
         with left:
-            short_put_leg = choose_contract(puts, "Short Put", max(put_center - 1, 0))
-            long_put_leg = choose_contract(puts, "Long Lower Put", max(put_center - 3, 0))
+            short_put_leg = choose_contract(puts, "卖出 Put", max(put_center - 1, 0))
+            long_put_leg = choose_contract(puts, "买入更低行权价 Put", max(put_center - 3, 0))
         with right:
-            short_call_leg = choose_contract(calls, "Short Call", min(call_center + 1, len(calls) - 1))
-            long_call_leg = choose_contract(calls, "Long Higher Call", min(call_center + 3, len(calls) - 1))
+            short_call_leg = choose_contract(calls, "卖出 Call", min(call_center + 1, len(calls) - 1))
+            long_call_leg = choose_contract(calls, "买入更高行权价 Call", min(call_center + 3, len(calls) - 1))
     try:
         current_payload = strategy_payload(
             strategy,
@@ -952,10 +1019,10 @@ def page_options(conn):
         )
         curve, metrics = build_strategy_curve(strategy, prices, snapshot["price"], contracts, long_call_leg, short_call_leg, long_put_leg, short_put_leg, stock_shares)
     except Exception as exc:
-        st.error(f"Strategy calculation failed: {exc}")
-        st.info("Check that your long and short strikes are arranged correctly for the selected spread.")
+        st.error(f"策略计算失败：{exc}")
+        st.info("请检查当前价差组合里多空腿的行权价顺序是否正确。")
         return
-    st.subheader("Payoff Chart at Expiry")
+    st.subheader("到期收益曲线")
     st.line_chart(curve.set_index("Underlying Price")["P/L at Expiry"], height=380)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Max Profit", metrics["max_profit"])
@@ -963,7 +1030,7 @@ def page_options(conn):
     m3.metric("Breakeven", metrics["breakeven"])
     m4.metric("P/L at Spot", metrics["spot_pl"])
     st.caption(metrics["description"])
-    st.subheader("Selected Price Points")
+    st.subheader("关键价格点")
     focus = curve.iloc[[0, len(curve) // 4, len(curve) // 2, len(curve) * 3 // 4, len(curve) - 1]]
     st.dataframe(focus.style.format({"Underlying Price": "{:.2f}", "P/L at Expiry": "{:.2f}"}), use_container_width=True)
 
@@ -1026,27 +1093,27 @@ def page_options(conn):
             st.success("策略组已删除。")
             st.rerun()
 
-    st.subheader("Option Chain Reference")
+    st.subheader("期权链参考")
     left, right = st.columns(2)
     if not calls.empty:
-        left.dataframe(calls[["strike", "bid", "ask", "lastPrice", "mid", "impliedVolatility", "openInterest"]].rename(columns={"strike": "Call Strike", "lastPrice": "Last", "impliedVolatility": "IV", "openInterest": "OI"}).style.format({"Call Strike": "{:.2f}", "bid": "{:.2f}", "ask": "{:.2f}", "Last": "{:.2f}", "mid": "{:.2f}", "IV": "{:.2%}"}), use_container_width=True, height=320)
+        left.dataframe(calls[["strike", "bid", "ask", "lastPrice", "mid", "impliedVolatility", "openInterest"]].rename(columns={"strike": "Call行权价", "bid": "买价", "ask": "卖价", "lastPrice": "最新成交", "mid": "中间价", "impliedVolatility": "隐含波动率", "openInterest": "未平仓量"}).style.format({"Call行权价": "{:.2f}", "买价": "{:.2f}", "卖价": "{:.2f}", "最新成交": "{:.2f}", "中间价": "{:.2f}", "隐含波动率": "{:.2%}"}), use_container_width=True, height=320)
     if not puts.empty:
-        right.dataframe(puts[["strike", "bid", "ask", "lastPrice", "mid", "impliedVolatility", "openInterest"]].rename(columns={"strike": "Put Strike", "lastPrice": "Last", "impliedVolatility": "IV", "openInterest": "OI"}).style.format({"Put Strike": "{:.2f}", "bid": "{:.2f}", "ask": "{:.2f}", "Last": "{:.2f}", "mid": "{:.2f}", "IV": "{:.2%}"}), use_container_width=True, height=320)
+        right.dataframe(puts[["strike", "bid", "ask", "lastPrice", "mid", "impliedVolatility", "openInterest"]].rename(columns={"strike": "Put行权价", "bid": "买价", "ask": "卖价", "lastPrice": "最新成交", "mid": "中间价", "impliedVolatility": "隐含波动率", "openInterest": "未平仓量"}).style.format({"Put行权价": "{:.2f}", "买价": "{:.2f}", "卖价": "{:.2f}", "最新成交": "{:.2f}", "中间价": "{:.2f}", "隐含波动率": "{:.2%}"}), use_container_width=True, height=320)
 
 
 def main():
-    st.set_page_config(page_title="Local Portfolio Tracker", layout="wide")
+    st.set_page_config(page_title="本地投资记录", layout="wide")
     conn = get_conn()
     menu = {
-        "Dashboard": page_dashboard,
-        "Transactions": page_transactions,
-        "Watchlist": page_targets,
-        "Realtime Watchlist": page_realtime_watchlist,
-        "Events": page_events,
-        "Options": page_options,
+        "投资组合": page_dashboard,
+        "交易记录": page_transactions,
+        "个股研究": page_targets,
+        "实时自选": page_realtime_watchlist,
+        "事件日历": page_events,
+        "期权策略": page_options,
     }
-    choice = st.sidebar.radio("Menu", list(menu.keys()))
-    st.sidebar.caption("Data is stored in data/portfolio.db")
+    choice = st.sidebar.radio("菜单", list(menu.keys()))
+    st.sidebar.caption("数据持久化保存在 data/portfolio.db")
     menu[choice](conn)
 
 
