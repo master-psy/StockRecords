@@ -1,10 +1,12 @@
 import os
 import sqlite3
+import json
 from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
@@ -40,6 +42,33 @@ def init_db(conn):
             event_date TEXT NOT NULL, category TEXT NOT NULL, ticker TEXT,
             title TEXT NOT NULL, impact TEXT
         );
+        CREATE TABLE IF NOT EXISTS watch_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_type TEXT NOT NULL,
+            market TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            name TEXT,
+            underlying TEXT,
+            expiry TEXT,
+            strike REAL,
+            option_type TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_items_symbol ON watch_items(symbol);
+        CREATE TABLE IF NOT EXISTS option_strategy_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            ticker TEXT NOT NULL,
+            expiration TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            contracts INTEGER NOT NULL,
+            stock_shares INTEGER NOT NULL DEFAULT 0,
+            note TEXT,
+            config_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     conn.commit()
@@ -73,6 +102,22 @@ def load_prices(conn):
 
 def load_events(conn):
     return pd.read_sql_query("SELECT * FROM events ORDER BY event_date", conn, parse_dates=["event_date"])
+
+
+def load_watch_items(conn):
+    return pd.read_sql_query(
+        "SELECT * FROM watch_items ORDER BY asset_type, market, symbol, underlying, expiry, strike, option_type, id",
+        conn,
+        parse_dates=["created_at", "expiry"],
+    )
+
+
+def load_option_strategy_groups(conn):
+    return pd.read_sql_query(
+        "SELECT * FROM option_strategy_groups ORDER BY updated_at DESC, id DESC",
+        conn,
+        parse_dates=["created_at", "updated_at", "expiration"],
+    )
 
 
 def save_transaction(conn, data):
@@ -113,6 +158,61 @@ def save_event(conn, data):
         "INSERT INTO events (event_date, category, ticker, title, impact) VALUES (:event_date, :category, :ticker, :title, :impact)",
         data,
     )
+    conn.commit()
+
+
+def save_watch_item(conn, data):
+    conn.execute(
+        """
+        INSERT INTO watch_items (
+            asset_type, market, symbol, name, underlying, expiry, strike, option_type, note, created_at
+        ) VALUES (
+            :asset_type, :market, :symbol, :name, :underlying, :expiry, :strike, :option_type, :note, :created_at
+        )
+        ON CONFLICT(symbol) DO UPDATE SET
+            name=excluded.name,
+            note=excluded.note
+        """,
+        data,
+    )
+    conn.commit()
+
+
+def delete_watch_item(conn, item_id):
+    conn.execute("DELETE FROM watch_items WHERE id = ?", (item_id,))
+    conn.commit()
+
+
+def save_option_strategy_group(conn, data):
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        """
+        INSERT INTO option_strategy_groups (
+            name, ticker, expiration, strategy, contracts, stock_shares, note, config_json, created_at, updated_at
+        ) VALUES (
+            :name, :ticker, :expiration, :strategy, :contracts, :stock_shares, :note, :config_json, :created_at, :updated_at
+        )
+        ON CONFLICT(name) DO UPDATE SET
+            ticker=excluded.ticker,
+            expiration=excluded.expiration,
+            strategy=excluded.strategy,
+            contracts=excluded.contracts,
+            stock_shares=excluded.stock_shares,
+            note=excluded.note,
+            config_json=excluded.config_json,
+            updated_at=excluded.updated_at
+        """,
+        {
+            **data,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    conn.commit()
+
+
+def delete_option_strategy_group(conn, group_id):
+    conn.execute("DELETE FROM option_strategy_groups WHERE id = ?", (group_id,))
     conn.commit()
 
 
@@ -164,6 +264,152 @@ def format_number(val):
     if abs(val) >= 1e6:
         return f"{val / 1e6:.2f}M"
     return f"{val:,.2f}"
+
+
+def normalize_watch_symbol(symbol, market):
+    base = (symbol or "").strip().upper()
+    if not base:
+        return ""
+    if market == "CN":
+        digits = "".join(ch for ch in base if ch.isdigit())
+        if len(digits) != 6:
+            return base
+        suffix = ".SS" if digits.startswith(("5", "6", "9")) else ".SZ"
+        return f"{digits}{suffix}"
+    if market == "HK":
+        digits = "".join(ch for ch in base if ch.isdigit())
+        if digits:
+            return f"{digits.zfill(4)}.HK"
+        return base if base.endswith(".HK") else f"{base}.HK"
+    return base
+
+
+def normalize_text(value):
+    return value.strip().upper() if value else None
+
+
+def safe_float(value):
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_latest_price_frame(ticker):
+    intraday = ticker.history(period="1d", interval="1m", auto_adjust=False, prepost=True)
+    if not intraday.empty:
+        return intraday, True
+    daily = ticker.history(period="5d", auto_adjust=False)
+    return daily, False
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def fetch_equity_quote(symbol):
+    ticker = yf.Ticker(symbol)
+    hist, is_intraday = get_latest_price_frame(ticker)
+    if hist.empty:
+        raise ValueError(f"Unable to fetch quote for {symbol}")
+    price = safe_float(hist["Close"].iloc[-1])
+    prev_close = None
+    price_hint = None
+    fast_info = getattr(ticker, "fast_info", None)
+    if fast_info:
+        for key in ("lastPrice", "regularMarketPrice", "last_price"):
+            try:
+                price_hint = safe_float(fast_info.get(key))
+            except Exception:
+                price_hint = None
+            if price_hint:
+                break
+        for key in ("previousClose", "regularMarketPreviousClose", "previous_close"):
+            try:
+                prev_close = safe_float(fast_info.get(key))
+            except Exception:
+                prev_close = None
+            if prev_close:
+                break
+    if price_hint:
+        price = price_hint
+    try:
+        info = ticker.info
+    except Exception:
+        info = {}
+    if prev_close in (None, 0):
+        for key in ("regularMarketPreviousClose", "previousClose"):
+            prev_close = safe_float(info.get(key))
+            if prev_close not in (None, 0):
+                break
+    if prev_close in (None, 0):
+        daily_hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        if len(daily_hist) >= 2:
+            prev_close = safe_float(daily_hist["Close"].iloc[-2])
+        elif len(hist) > 1:
+            prev_close = safe_float(hist["Close"].iloc[-2])
+        else:
+            prev_close = price
+    name = info.get("shortName") or info.get("longName") or symbol
+    currency = info.get("currency") or ("HKD" if symbol.endswith(".HK") else "CNY" if symbol.endswith((".SS", ".SZ")) else "USD")
+    exchange = info.get("exchange") or info.get("fullExchangeName")
+    return {
+        "symbol": symbol,
+        "name": name,
+        "price": price,
+        "prev_close": prev_close,
+        "change": None if price is None or prev_close in (None, 0) else price - prev_close,
+        "change_pct": None if price is None or prev_close in (None, 0) else (price - prev_close) / prev_close * 100,
+        "currency": currency,
+        "exchange": exchange,
+        "quote_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "1m" if is_intraday else "daily",
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def fetch_option_quote(underlying, expiration, strike, option_type):
+    chain = yf.Ticker(underlying).option_chain(expiration)
+    frame = chain.calls if option_type == "call" else chain.puts
+    if frame.empty:
+        raise ValueError("No option contracts returned")
+    frame = frame.copy()
+    frame["strike_diff"] = (frame["strike"] - float(strike)).abs()
+    contract = frame.sort_values(["strike_diff", "openInterest"], ascending=[True, False]).iloc[0]
+    bid = safe_float(contract.get("bid"))
+    ask = safe_float(contract.get("ask"))
+    last_price = safe_float(contract.get("lastPrice"))
+    if bid and ask:
+        mark = (bid + ask) / 2
+    else:
+        mark = last_price
+    underlying_quote = fetch_equity_quote(underlying)
+    return {
+        "symbol": contract.get("contractSymbol"),
+        "name": f"{underlying} {expiration} {option_type.upper()} {float(contract['strike']):.2f}",
+        "price": mark,
+        "prev_close": safe_float(contract.get("lastPrice")),
+        "change": None if mark is None or last_price is None else mark - last_price,
+        "change_pct": None if mark is None or last_price in (None, 0) else (mark - last_price) / last_price * 100,
+        "bid": bid,
+        "ask": ask,
+        "last": last_price,
+        "volume": int(contract.get("volume") or 0),
+        "open_interest": int(contract.get("openInterest") or 0),
+        "implied_volatility": safe_float(contract.get("impliedVolatility")),
+        "underlying_price": underlying_quote["price"],
+        "currency": underlying_quote["currency"],
+        "exchange": "US Options",
+        "quote_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "option-chain",
+        "matched_strike": float(contract["strike"]),
+    }
+
+
+def fetch_watch_quote(item):
+    asset_type = item["asset_type"]
+    if asset_type == "option":
+        return fetch_option_quote(item["underlying"], item["expiry"], item["strike"], item["option_type"])
+    return fetch_equity_quote(item["symbol"])
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -246,6 +492,48 @@ def choose_contract(df, label, default_idx=0):
     selected = st.selectbox(label, options=list(range(len(df))), index=idx, format_func=lambda i: df.iloc[i]["display"])
     row = df.iloc[selected]
     return {"strike": float(row["strike"]), "premium": float(row["mid"])}
+
+
+def strategy_payload(strategy, ticker, expiration, contracts, stock_shares, spot_price, long_call_leg=None, short_call_leg=None, long_put_leg=None, short_put_leg=None):
+    return {
+        "strategy": strategy,
+        "ticker": ticker,
+        "expiration": expiration,
+        "contracts": int(contracts),
+        "stock_shares": int(stock_shares),
+        "spot_price": safe_float(spot_price),
+        "legs": {
+            "long_call_leg": long_call_leg,
+            "short_call_leg": short_call_leg,
+            "long_put_leg": long_put_leg,
+            "short_put_leg": short_put_leg,
+        },
+    }
+
+
+def render_strategy_curve(payload, title_prefix=""):
+    prices = make_price_grid(payload["spot_price"])
+    curve, metrics = build_strategy_curve(
+        payload["strategy"],
+        prices,
+        payload["spot_price"],
+        payload["contracts"],
+        payload["legs"].get("long_call_leg"),
+        payload["legs"].get("short_call_leg"),
+        payload["legs"].get("long_put_leg"),
+        payload["legs"].get("short_put_leg"),
+        payload["stock_shares"],
+    )
+    st.subheader(f"{title_prefix}收益曲线")
+    st.line_chart(curve.set_index("Underlying Price")["P/L at Expiry"], height=380)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("最大收益", metrics["max_profit"])
+    m2.metric("最大亏损", metrics["max_loss"])
+    m3.metric("盈亏平衡点", metrics["breakeven"])
+    m4.metric("当前价位盈亏", metrics["spot_pl"])
+    st.caption(metrics["description"])
+    focus = curve.iloc[[0, len(curve) // 4, len(curve) // 2, len(curve) * 3 // 4, len(curve) - 1]]
+    st.dataframe(focus.style.format({"Underlying Price": "{:.2f}", "P/L at Expiry": "{:.2f}"}), use_container_width=True)
 
 
 def build_strategy_curve(strategy, prices, spot_price, contracts, long_call_leg=None, short_call_leg=None, long_put_leg=None, short_put_leg=None, stock_shares=100):
@@ -395,6 +683,152 @@ def page_targets(conn):
         st.dataframe(targets, use_container_width=True)
 
 
+def page_realtime_watchlist(conn):
+    st.header("Realtime Watchlist")
+    st.caption("支持 A 股、港股、美股与美股期权。股票代码示例：600519、0700、AAPL；期权按标的+到期日+行权价添加。")
+
+    with st.expander("新增自选标的", expanded=True):
+        asset_type = st.radio("资产类型", ["stock", "option"], horizontal=True, format_func=lambda x: "股票 / ETF" if x == "stock" else "期权")
+        if asset_type == "stock":
+            col1, col2, col3 = st.columns(3)
+            market = col1.selectbox("市场", ["CN", "HK", "US"], format_func=lambda x: {"CN": "A 股", "HK": "港股", "US": "美股"}[x])
+            raw_symbol = col2.text_input("代码", placeholder="600519 / 0700 / AAPL")
+            name = col3.text_input("备注名称", placeholder="贵州茅台 / 腾讯 / Apple")
+            note = st.text_area("备注", height=70)
+            if st.button("添加股票自选", type="primary"):
+                symbol = normalize_watch_symbol(raw_symbol, market)
+                if not symbol:
+                    st.error("请输入有效代码。")
+                else:
+                    save_watch_item(
+                        conn,
+                        {
+                            "asset_type": "stock",
+                            "market": market,
+                            "symbol": symbol,
+                            "name": name,
+                            "underlying": None,
+                            "expiry": None,
+                            "strike": None,
+                            "option_type": None,
+                            "note": note,
+                            "created_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+                    st.success(f"已添加 {symbol}")
+                    st.rerun()
+        else:
+            col1, col2, col3, col4 = st.columns(4)
+            underlying_raw = col1.text_input("标的代码", placeholder="AAPL")
+            expiry = col2.date_input("到期日", value=date.today() + timedelta(days=30))
+            option_type = col3.selectbox("期权类型", ["call", "put"], format_func=lambda x: "Call" if x == "call" else "Put")
+            strike = col4.number_input("行权价", min_value=0.01, step=0.5)
+            option_name = st.text_input("备注名称", placeholder="AAPL 近月看涨")
+            note = st.text_area("备注", height=70, key="option_note")
+            if st.button("添加期权自选", type="primary"):
+                underlying = normalize_watch_symbol(underlying_raw, "US")
+                if not underlying or strike <= 0:
+                    st.error("请填写有效的美股标的和行权价。")
+                else:
+                    save_watch_item(
+                        conn,
+                        {
+                            "asset_type": "option",
+                            "market": "US",
+                            "symbol": f"{underlying}-{expiry.isoformat()}-{option_type.upper()}-{strike:.2f}",
+                            "name": option_name,
+                            "underlying": underlying,
+                            "expiry": expiry.isoformat(),
+                            "strike": strike,
+                            "option_type": option_type,
+                            "note": note,
+                            "created_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+                    st.success("已添加期权自选")
+                    st.rerun()
+
+    items = load_watch_items(conn)
+    if items.empty:
+        st.info("还没有自选标的，先在上方添加一个。")
+        return
+
+    toolbar_left, toolbar_mid, toolbar_right = st.columns([1, 1, 3])
+    refresh_now = toolbar_left.button("立即刷新")
+    auto_refresh = toolbar_mid.checkbox("15 秒自动刷新", value=False)
+    if refresh_now:
+        st.cache_data.clear()
+        st.rerun()
+    if auto_refresh:
+        components.html(
+            """
+            <script>
+            setTimeout(function() {
+              window.parent.location.reload();
+            }, 15000);
+            </script>
+            """,
+            height=0,
+        )
+
+    rows = []
+    errors = []
+    for _, item in items.iterrows():
+        try:
+            quote = fetch_watch_quote(item)
+            rows.append(
+                {
+                    "ID": int(item["id"]),
+                    "类型": "期权" if item["asset_type"] == "option" else "股票",
+                    "市场": {"CN": "A 股", "HK": "港股", "US": "美股"}[item["market"]] if item["asset_type"] != "option" else "美股期权",
+                    "代码": item["symbol"],
+                    "名称": item["name"] or quote.get("name") or "",
+                    "最新价": quote.get("price"),
+                    "涨跌额": quote.get("change"),
+                    "涨跌幅%": quote.get("change_pct"),
+                    "币种": quote.get("currency"),
+                    "交易所": quote.get("exchange"),
+                    "更新时间": quote.get("quote_time"),
+                    "备注": item["note"] or "",
+                    "细节": (
+                        f"标的 {item['underlying']} | 到期 {pd.to_datetime(item['expiry']).date()} | "
+                        f"{str(item['option_type']).upper()} | 行权价 {float(item['strike']):.2f} | "
+                        f"Bid {quote.get('bid') or 0:.2f} / Ask {quote.get('ask') or 0:.2f} | "
+                        f"OI {quote.get('open_interest', 0)} | IV {quote.get('implied_volatility') or 0:.2%}"
+                    )
+                    if item["asset_type"] == "option"
+                    else f"数据源 {quote.get('source')}",
+                }
+            )
+        except Exception as exc:
+            errors.append(f"{item['symbol']}: {exc}")
+
+    if rows:
+        quote_df = pd.DataFrame(rows)
+        st.subheader("行情列表")
+        st.dataframe(
+            quote_df.style.format({"最新价": "{:.2f}", "涨跌额": "{:+.2f}", "涨跌幅%": "{:+.2f}%"}),
+            use_container_width=True,
+            height=420,
+        )
+    else:
+        st.warning("暂时没有成功拉到任何行情。")
+
+    if errors:
+        st.warning("部分标的拉取失败：")
+        for err in errors:
+            st.write(f"- {err}")
+
+    delete_options = {f"{row['ID']} | {row['代码']} | {row['名称']}": int(row["ID"]) for row in rows}
+    if delete_options:
+        delete_col1, delete_col2 = st.columns([3, 1])
+        delete_choice = delete_col1.selectbox("删除自选", options=list(delete_options.keys()))
+        if delete_col2.button("删除所选"):
+            delete_watch_item(conn, delete_options[delete_choice])
+            st.success("已删除自选标的")
+            st.rerun()
+
+
 def page_events(conn):
     st.header("Upcoming Events")
     today = datetime.today().date()
@@ -421,9 +855,9 @@ def page_events(conn):
             st.rerun()
 
 
-def page_options():
+def page_options(conn):
     st.header("Options Payoff Curves")
-    st.caption("Load stock and option-chain data and inspect expiry payoff curves across strategies.")
+    st.caption("支持期权策略到期收益曲线查看，并可将策略组持久化保存到本地数据库。")
     ticker = st.text_input("Ticker", value="AAPL", help="Examples: AAPL, TSLA, SPY").upper().strip()
     if not ticker:
         st.info("Enter a ticker to continue.")
@@ -504,6 +938,18 @@ def page_options():
             short_call_leg = choose_contract(calls, "Short Call", min(call_center + 1, len(calls) - 1))
             long_call_leg = choose_contract(calls, "Long Higher Call", min(call_center + 3, len(calls) - 1))
     try:
+        current_payload = strategy_payload(
+            strategy,
+            ticker,
+            expiration,
+            contracts,
+            stock_shares,
+            snapshot["price"],
+            long_call_leg,
+            short_call_leg,
+            long_put_leg,
+            short_put_leg,
+        )
         curve, metrics = build_strategy_curve(strategy, prices, snapshot["price"], contracts, long_call_leg, short_call_leg, long_put_leg, short_put_leg, stock_shares)
     except Exception as exc:
         st.error(f"Strategy calculation failed: {exc}")
@@ -520,6 +966,66 @@ def page_options():
     st.subheader("Selected Price Points")
     focus = curve.iloc[[0, len(curve) // 4, len(curve) // 2, len(curve) * 3 // 4, len(curve) - 1]]
     st.dataframe(focus.style.format({"Underlying Price": "{:.2f}", "P/L at Expiry": "{:.2f}"}), use_container_width=True)
+
+    st.subheader("保存策略组")
+    default_name = f"{ticker} {expiration} {strategy}"
+    save_col1, save_col2 = st.columns([2, 3])
+    strategy_name = save_col1.text_input("策略组名称", value=default_name, key="strategy_group_name")
+    strategy_note = save_col2.text_input("备注", key="strategy_group_note")
+    if st.button("保存当前策略组", type="primary"):
+        if not strategy_name.strip():
+            st.error("策略组名称不能为空。")
+        else:
+            save_option_strategy_group(
+                conn,
+                {
+                    "name": strategy_name.strip(),
+                    "ticker": ticker,
+                    "expiration": expiration,
+                    "strategy": strategy,
+                    "contracts": int(contracts),
+                    "stock_shares": int(stock_shares),
+                    "note": strategy_note.strip(),
+                    "config_json": json.dumps(current_payload, ensure_ascii=False),
+                },
+            )
+            st.success("策略组已保存。")
+            st.rerun()
+
+    saved_groups = load_option_strategy_groups(conn)
+    st.subheader("已保存策略组")
+    if saved_groups.empty:
+        st.info("还没有已保存的期权策略组。")
+    else:
+        display_options = {
+            f"{row['name']} | {row['ticker']} | {row['strategy']} | {pd.to_datetime(row['expiration']).date()}": int(row["id"])
+            for _, row in saved_groups.iterrows()
+        }
+        selected_label = st.selectbox("选择策略组", options=list(display_options.keys()))
+        selected_group = saved_groups[saved_groups["id"] == display_options[selected_label]].iloc[0]
+        saved_payload = json.loads(selected_group["config_json"])
+        saved_spot = saved_payload.get("spot_price")
+        try:
+            latest_snapshot = fetch_stock_snapshot(saved_payload["ticker"])
+            if latest_snapshot.get("price"):
+                saved_payload["spot_price"] = latest_snapshot["price"]
+        except Exception:
+            saved_payload["spot_price"] = saved_spot
+        meta1, meta2, meta3, meta4 = st.columns(4)
+        meta1.metric("标的", saved_payload["ticker"])
+        meta2.metric("到期日", str(saved_payload["expiration"]))
+        meta3.metric("策略", saved_payload["strategy"])
+        meta4.metric("合约数", str(saved_payload["contracts"]))
+        if selected_group["note"]:
+            st.caption(selected_group["note"])
+        render_strategy_curve(saved_payload, title_prefix="已保存策略组")
+        delete_col1, delete_col2 = st.columns([3, 1])
+        delete_col1.caption(f"最近更新：{selected_group['updated_at']}")
+        if delete_col2.button("删除该策略组"):
+            delete_option_strategy_group(conn, int(selected_group["id"]))
+            st.success("策略组已删除。")
+            st.rerun()
+
     st.subheader("Option Chain Reference")
     left, right = st.columns(2)
     if not calls.empty:
@@ -531,7 +1037,14 @@ def page_options():
 def main():
     st.set_page_config(page_title="Local Portfolio Tracker", layout="wide")
     conn = get_conn()
-    menu = {"Dashboard": page_dashboard, "Transactions": page_transactions, "Watchlist": page_targets, "Events": page_events, "Options": lambda _conn: page_options()}
+    menu = {
+        "Dashboard": page_dashboard,
+        "Transactions": page_transactions,
+        "Watchlist": page_targets,
+        "Realtime Watchlist": page_realtime_watchlist,
+        "Events": page_events,
+        "Options": page_options,
+    }
     choice = st.sidebar.radio("Menu", list(menu.keys()))
     st.sidebar.caption("Data is stored in data/portfolio.db")
     menu[choice](conn)
